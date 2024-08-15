@@ -148,7 +148,7 @@ static void remove_allocated_tensor(struct ggml_dyn_tallocr * alloc, size_t offs
 static size_t ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t size, const struct ggml_tensor * tensor) {
     size = aligned_offset(NULL, size, alloc->alignment);
 
-    AT_PRINTF("%s: allocating %s (%zu bytes) - ", __func__, tensor->name, size);
+    //fprintf(stderr, "%s: allocating %s (%zu bytes) - \n", __func__, tensor->name, size);
 
     size_t max_avail = 0;
 
@@ -190,7 +190,8 @@ static size_t ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t siz
         }
     }
 
-    AT_PRINTF("block %d, offset %zu\n", best_fit_block, offset);
+    //fprintf(stderr, "block %d, offset %zu\n", best_fit_block, offset);
+    //fprintf(stderr, "%s: cur_max = %d, alloc->max_size = %d\n", __func__, offset + size, alloc->max_size);
 
 #ifdef GGML_ALLOCATOR_DEBUG
     add_allocated_tensor(alloc, offset, tensor);
@@ -221,6 +222,9 @@ static size_t ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t siz
         fprintf(stderr, "\n");
     }
 #endif
+
+    if (MAX(alloc->max_size, offset + size) == 0)
+        fprintf(stderr, "max_size = %d, offset + size = %d\n", alloc->max_size, offset + size);
 
     alloc->max_size = MAX(alloc->max_size, offset + size);
 
@@ -761,9 +765,7 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         if (new_size > cur_size || galloc->buffers[i] == NULL) {
-#ifndef NDEBUG
             fprintf(stderr, "%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-#endif
 
             ggml_backend_buffer_free(galloc->buffers[i]);
             galloc->buffers[i] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], new_size);
