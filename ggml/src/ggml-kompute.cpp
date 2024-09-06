@@ -48,7 +48,7 @@
 #include <utility>
 #include <vector>
 
-#include <kompute/Kompute.hpp>
+#include "kompute/Kompute.hpp"
 #include <vulkan/vulkan.hpp>
 
 #ifdef __linux__
@@ -66,30 +66,29 @@ static std::string ggml_kompute_format_name(int device) {
     return "Kompute" + std::to_string(device);
 }
 
-struct ggml_backend_kompute_context {
-    int device;
+struct kompute_device
+{
+    int index;
     std::string name;
-
     kp::Manager manager;
-    std::shared_ptr<vk::DescriptorPool> pool;
-
     ggml_backend_buffer_type buft;
+    std::shared_ptr<vk::DescriptorPool> pool;
+};
 
-    ggml_backend_kompute_context(int device)
-        : device(device), name(ggml_kompute_format_name(device)) { buft.context = nullptr; }
+
+struct ggml_backend_kompute_context {
+    std::string name;
+    kompute_device * device = nullptr;
 };
 
 
 struct ggml_backend_kompute_buffer_type_context {
-    int         device;
-    int         device_ref = 0;
+    std::string name;
+    kompute_device * device = nullptr;
     uint64_t    buffer_alignment;
     uint64_t    max_alloc;
-    std::string name;
-
-    ggml_backend_kompute_buffer_type_context(int device, uint64_t buffer_alignment, uint64_t max_alloc)
-        : device(device), buffer_alignment(buffer_alignment), max_alloc(max_alloc), name(ggml_kompute_format_name(device)) {}
 };
+
 
 struct ggml_vk_memory {
     void *data = nullptr;
@@ -100,64 +99,31 @@ struct ggml_vk_memory {
     vk::Buffer *stagingBuffer = nullptr;
 };
 
+
 struct ggml_backend_kompute_buffer_context {
+    kompute_device * device;
     struct ggml_vk_memory memory;
 };
+
 
 class kompute_manager {
 public:
     kompute_manager();
     ~kompute_manager();
 
-    kp::Manager *get_kp_manager(void);
-    ggml_backend_t create_backend(int device);
-    void destroy_backend(ggml_backend_t backend);
-    ggml_backend_t get_backend(int device);
+    kp::Manager * get_kp_manager(void);
+    kompute_device * get_device(int index);
 
 private:
     // Only for global queries, not for creating devices
     kp::Manager *m_kp_manager;
 
-    std::vector<ggml_backend_t> m_backends;
+    std::vector<kompute_device *> m_devices;
 };
 
 
 static kompute_manager komputeManager;
 
-
-static ggml_backend_t kompute_backend(int device)
-{
-    return komputeManager.get_backend(device);
-}
-
-static ggml_backend_t kompute_backend(ggml_backend_buffer_type_t buffer_type)
-{
-    auto *buft_ctx = static_cast<ggml_backend_kompute_buffer_type_context *>(buffer_type->context);
-    return kompute_backend(buft_ctx->device);
-}
-
-static ggml_backend_t kompute_backend(ggml_backend_buffer_t buffer)
-{
-    return kompute_backend(buffer->buft);
-}
-
-static ggml_backend_kompute_context *kompute_backend_context(int device)
-{
-    auto * backend = kompute_backend(device);
-    return backend ? static_cast<ggml_backend_kompute_context *>(backend->context) : nullptr;
-}
-
-static ggml_backend_kompute_context *kompute_backend_context(ggml_backend_buffer_t buffer)
-{
-    auto * backend = kompute_backend(buffer);
-    return backend ? static_cast<ggml_backend_kompute_context *>(backend->context) : nullptr;
-}
-
-static ggml_backend_kompute_context *kompute_backend_context(ggml_backend_buffer_type_t buffer_type)
-{
-    auto * backend = kompute_backend(buffer_type);
-    return backend ? static_cast<ggml_backend_kompute_context *>(backend->context) : nullptr;
-}
 
 #ifdef __linux__
 __attribute__((constructor))
@@ -399,21 +365,21 @@ bool ggml_vk_has_vulkan() {
 }
 
 static bool ggml_vk_has_device(struct ggml_backend_kompute_context *ctx) {
-    return ctx->manager.hasDevice();
+    return ctx->device->manager.hasDevice();
 }
 
 static ggml_vk_device ggml_vk_current_device(struct ggml_backend_kompute_context *ctx) {
-    if (!ctx->manager.hasDevice())
+    if (!ctx->device->manager.hasDevice())
         return ggml_vk_device();
 
     auto devices = ggml_vk_available_devices_internal(0);
-    ggml_vk_filterByName(devices, ctx->manager.physicalDevice()->getProperties().deviceName.data());
+    ggml_vk_filterByName(devices, ctx->device->manager.physicalDevice()->getProperties().deviceName.data());
     GGML_ASSERT(!devices.empty());
     return devices.front();
 }
 
 static
-void ggml_vk_allocate_descriptor_pool(struct ggml_backend_kompute_context * ctx, size_t size) {
+void ggml_vk_allocate_descriptor_pool(kompute_device * device, size_t size) {
     std::vector<vk::DescriptorPoolSize> descriptorPoolSizes = {
         vk::DescriptorPoolSize(
           vk::DescriptorType::eStorageBuffer,
@@ -427,25 +393,25 @@ void ggml_vk_allocate_descriptor_pool(struct ggml_backend_kompute_context * ctx,
       static_cast<uint32_t>(descriptorPoolSizes.size()),
       descriptorPoolSizes.data());
 
-    ctx->pool = std::make_shared<vk::DescriptorPool>();
-    vk::Result r = ctx->manager.device()->createDescriptorPool(
-      &descriptorPoolInfo, nullptr, ctx->pool.get());
+    device->pool = std::make_shared<vk::DescriptorPool>();
+    vk::Result r = device->manager.device()->createDescriptorPool(
+      &descriptorPoolInfo, nullptr, device->pool.get());
     if (r != vk::Result::eSuccess)
         std::cerr << "Error allocating descriptor pool" << vk::to_string(r);
 }
 
 static
-void ggml_vk_free_descriptor_pool(struct ggml_backend_kompute_context * ctx) {
-    if (ctx->pool) {
-        ctx->manager.device()->destroy(
-          *ctx->pool,
+void ggml_vk_free_descriptor_pool(kompute_device * device) {
+    if (device->pool) {
+        device->manager.device()->destroy(
+          *device->pool,
           (vk::Optional<const vk::AllocationCallbacks>)nullptr);
-        ctx->pool = nullptr;
+        device->pool = nullptr;
     }
 }
 
 static
-vk::Buffer *ggml_vk_allocate_buffer(struct ggml_backend_kompute_context * ctx, size_t size) {
+vk::Buffer *ggml_vk_allocate_buffer(kompute_device * device, size_t size) {
     vk::BufferCreateInfo bufferCreateInfo;
     bufferCreateInfo.size = size;
     bufferCreateInfo.usage = vk::BufferUsageFlagBits::eStorageBuffer |
@@ -454,18 +420,18 @@ vk::Buffer *ggml_vk_allocate_buffer(struct ggml_backend_kompute_context * ctx, s
     bufferCreateInfo.sharingMode = vk::SharingMode::eExclusive;
 
     vk::Buffer *vkBuffer = new vk::Buffer;
-    vk::Result r = ctx->manager.device()->createBuffer(&bufferCreateInfo, nullptr, vkBuffer);
+    vk::Result r = device->manager.device()->createBuffer(&bufferCreateInfo, nullptr, vkBuffer);
     if (r != vk::Result::eSuccess)
         std::cerr << "Error allocating buffer " << vk::to_string(r) << std::endl;
     return vkBuffer;
 }
 
 static
-vk::DeviceMemory *ggml_vk_allocate(struct ggml_backend_kompute_context * ctx, size_t size, vk::MemoryPropertyFlags flags, vk::MemoryRequirements requirements, bool *isHostVisible) {
+vk::DeviceMemory *ggml_vk_allocate(kompute_device * device, size_t size, vk::MemoryPropertyFlags flags, vk::MemoryRequirements requirements, bool *isHostVisible) {
 
     uint32_t memoryTypeIndex = -1;
     bool memoryTypeIndexFound = false;
-    vk::PhysicalDeviceMemoryProperties memoryProperties = ctx->manager.physicalDevice()->getMemoryProperties();
+    vk::PhysicalDeviceMemoryProperties memoryProperties = device->manager.physicalDevice()->getMemoryProperties();
     for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++) {
         const vk::MemoryType &memoryType = memoryProperties.memoryTypes[i];
         const vk::MemoryHeap &memoryHeap = memoryProperties.memoryHeaps[memoryType.heapIndex];
@@ -494,7 +460,7 @@ vk::DeviceMemory *ggml_vk_allocate(struct ggml_backend_kompute_context * ctx, si
     allocInfo.allocationSize = size;
     allocInfo.memoryTypeIndex = memoryTypeIndex;
     vk::DeviceMemory *vkDeviceMemory =  new vk::DeviceMemory;
-    vk::Result r = ctx->manager.device()->allocateMemory(&allocInfo, nullptr, vkDeviceMemory);
+    vk::Result r = device->manager.device()->allocateMemory(&allocInfo, nullptr, vkDeviceMemory);
     if (r != vk::Result::eSuccess) {
         std::cerr << "Error allocating memory " << vk::to_string(r) << std::endl;
         throw std::runtime_error("Error allocating vulkan memory.");
@@ -514,31 +480,31 @@ static size_t ggml_vk_aligned_offset(ggml_backend_buffer_t buffer, size_t offset
     return (offset / minStorageBufferOffsetAlignment) * minStorageBufferOffsetAlignment;
 }
 
-static ggml_vk_memory ggml_vk_allocate(struct ggml_backend_kompute_context * ctx, size_t size) {
+static ggml_vk_memory ggml_vk_allocate(kompute_device * device, size_t size) {
     ggml_vk_memory memory;
     bool isHostVisible = false;
     {
-        memory.primaryBuffer = ggml_vk_allocate_buffer(ctx, size);
-        vk::MemoryRequirements memoryRequirements = ctx->manager.device()->getBufferMemoryRequirements(*memory.primaryBuffer);
+        memory.primaryBuffer = ggml_vk_allocate_buffer(device, size);
+        vk::MemoryRequirements memoryRequirements = device->manager.device()->getBufferMemoryRequirements(*memory.primaryBuffer);
         vk::MemoryPropertyFlags memoryPropertyFlags = vk::MemoryPropertyFlagBits::eDeviceLocal;
-        memory.primaryMemory = ggml_vk_allocate(ctx, size, memoryPropertyFlags, memoryRequirements, &isHostVisible);
-        ctx->manager.device()->bindBufferMemory(*memory.primaryBuffer, *memory.primaryMemory, 0);
+        memory.primaryMemory = ggml_vk_allocate(device, size, memoryPropertyFlags, memoryRequirements, &isHostVisible);
+        device->manager.device()->bindBufferMemory(*memory.primaryBuffer, *memory.primaryMemory, 0);
         if (isHostVisible) {
-            vk::Result r = ctx->manager.device()->mapMemory(*memory.primaryMemory, 0, size, vk::MemoryMapFlags(), &memory.data);
+            vk::Result r = device->manager.device()->mapMemory(*memory.primaryMemory, 0, size, vk::MemoryMapFlags(), &memory.data);
             if (r != vk::Result::eSuccess)
                 std::cerr << "Error mapping memory" << vk::to_string(r);
         }
     }
 
     if (!isHostVisible) {
-        memory.stagingBuffer = ggml_vk_allocate_buffer(ctx, size);
-        vk::MemoryRequirements memoryRequirements = ctx->manager.device()->getBufferMemoryRequirements(*memory.stagingBuffer);
+        memory.stagingBuffer = ggml_vk_allocate_buffer(device, size);
+        vk::MemoryRequirements memoryRequirements = device->manager.device()->getBufferMemoryRequirements(*memory.stagingBuffer);
         vk::MemoryPropertyFlags memoryPropertyFlags = vk::MemoryPropertyFlagBits::eHostVisible |
                                                       vk::MemoryPropertyFlagBits::eHostCoherent |
                                                       vk::MemoryPropertyFlagBits::eHostCached;
-        memory.stagingMemory = ggml_vk_allocate(ctx, size, memoryPropertyFlags, memoryRequirements, &isHostVisible);
-        ctx->manager.device()->bindBufferMemory(*memory.stagingBuffer, *memory.stagingMemory, 0);
-        vk::Result r = ctx->manager.device()->mapMemory(*memory.stagingMemory, 0, size, vk::MemoryMapFlags(), &memory.data);
+        memory.stagingMemory = ggml_vk_allocate(device, size, memoryPropertyFlags, memoryRequirements, &isHostVisible);
+        device->manager.device()->bindBufferMemory(*memory.stagingBuffer, *memory.stagingMemory, 0);
+        vk::Result r = device->manager.device()->mapMemory(*memory.stagingMemory, 0, size, vk::MemoryMapFlags(), &memory.data);
         if (r != vk::Result::eSuccess)
             std::cerr << "Error mapping memory" << vk::to_string(r);
     }
@@ -547,21 +513,21 @@ static ggml_vk_memory ggml_vk_allocate(struct ggml_backend_kompute_context * ctx
     return memory;
 }
 
-static void ggml_vk_free_memory(struct ggml_backend_kompute_context * ctx, ggml_vk_memory &memory)
+static void ggml_vk_free_memory(kompute_device * device, ggml_vk_memory &memory)
 {
-    ctx->manager.device()->destroy(
+    device->manager.device()->destroy(
       *memory.primaryBuffer,
       (vk::Optional<const vk::AllocationCallbacks>)nullptr);
     if (memory.stagingBuffer) {
-        ctx->manager.device()->destroy(
+        device->manager.device()->destroy(
           *memory.stagingBuffer,
           (vk::Optional<const vk::AllocationCallbacks>)nullptr);
     }
-    ctx->manager.device()->freeMemory(
+    device->manager.device()->freeMemory(
       *memory.primaryMemory,
       (vk::Optional<const vk::AllocationCallbacks>)nullptr);
     if (memory.stagingMemory) {
-        ctx->manager.device()->freeMemory(
+        device->manager.device()->freeMemory(
           *memory.stagingMemory,
           (vk::Optional<const vk::AllocationCallbacks>)nullptr);
     }
@@ -576,18 +542,18 @@ ggml_vk_memory * ggml_vk_find_tensor(const struct ggml_tensor * t, uint64_t & of
     // compatibility with ggml-backend
     GGML_ASSERT(buffer && buffer->buft->iface.get_name == ggml_backend_kompute_buffer_type_get_name);
 
-    ggml_vk_memory * buf_ctx = static_cast<ggml_vk_memory *>(buffer->context);
+    auto * buf_ctx = static_cast<ggml_backend_kompute_buffer_context *>(buffer->context);
 
-    const intptr_t ioffs = intptr_t(t->data) - intptr_t(buf_ctx->data);
+    const intptr_t ioffs = intptr_t(t->data) - intptr_t(buf_ctx->memory.data);
 
     GGML_ASSERT(ioffs >= 0 && ioffs + int64_t(ggml_nbytes(t)) <= int64_t(buffer->size));
 
     offset = uint64_t(ioffs);
-    return buf_ctx;
+    return &buf_ctx->memory;
 }
 
 static
-const std::shared_ptr<kp::Tensor> ggml_vk_get_tensor(struct ggml_backend_kompute_context * ctx, const struct ggml_tensor * t, uint32_t * alignedOffset = nullptr) {
+const std::shared_ptr<kp::Tensor> ggml_vk_get_tensor(kompute_device * device, const struct ggml_tensor * t, uint32_t * alignedOffset = nullptr) {
     uint64_t originalOffset = 0;
     auto * res = ggml_vk_find_tensor(t, originalOffset);
     if (!res) {
@@ -605,7 +571,7 @@ const std::shared_ptr<kp::Tensor> ggml_vk_get_tensor(struct ggml_backend_kompute
         nbytes += *alignedOffset;
     }
 
-    return ctx->manager.tensor(
+    return device->manager.tensor(
         t->data,
         nelements,
         nbytes, kp::Tensor::TensorDataTypes::eFloat,
@@ -672,14 +638,14 @@ static void ggml_vk_add(
     };
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(__func__, ctx->pool.get(), {inA, inB, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(__func__)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(__func__, ctx->device->pool.get(), {inA, inB, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned(ne01), unsigned(ne02), unsigned(ne03)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -705,14 +671,14 @@ static void ggml_vk_addrow(
     };
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__))
-        s_algo = ctx->manager.algorithm<float, PushConstants>(__func__, ctx->pool.get(), {inA, inB, out}, spirv, {size}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(__func__))
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(__func__, ctx->device->pool.get(), {inA, inB, out}, spirv, {size}, {}, {pushConsts});
     else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({size});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -753,14 +719,14 @@ static void ggml_vk_mul(
     };
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(__func__, ctx->pool.get(), {inA, inB, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(__func__)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(__func__, ctx->device->pool.get(), {inA, inB, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned(ne01), unsigned(ne02), unsigned(ne03)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -796,14 +762,14 @@ static void ggml_vk_scale(
     }
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(name, ctx->pool.get(), {in, out}, *spirv, {size}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(name)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(name, ctx->device->pool.get(), {in, out}, *spirv, {size}, {}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({in, out});
         s_algo->setWorkgroup({size});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -824,14 +790,14 @@ static void ggml_vk_xxlu(
 
     auto name = std::string(__func__) + "_" + suffix;
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(name, ctx->pool.get(), {in, out}, spirv, {size}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(name)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(name, ctx->device->pool.get(), {in, out}, spirv, {size}, {}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({in, out});
         s_algo->setWorkgroup({size});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -888,16 +854,16 @@ static void ggml_vk_soft_max(
     auto & inB_ = inB ? inB : inA;
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__)) {
+    if (!ctx->device->manager.hasAlgorithm(__func__)) {
         // FIXME: The softmax kernel needs to be fixed to use the subgroupsize which can vary by device
         const uint32_t local_x = 32;
-        s_algo = ctx->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->pool.get(), {inA, inB_, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {local_x}, {pushConsts});
+        s_algo = ctx->device->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->device->pool.get(), {inA, inB_, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {local_x}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB_, out});
         s_algo->setWorkgroup({unsigned(ne01), unsigned(ne02), unsigned(ne03)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -925,14 +891,14 @@ static void ggml_vk_norm_(
 
     auto name = std::string(__func__) + "_" + suffix;
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(name, ctx->pool.get(), {in, out}, spirv, {(uint32_t)nrows}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(name)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(name, ctx->device->pool.get(), {in, out}, spirv, {(uint32_t)nrows}, {}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({in, out});
         s_algo->setWorkgroup({(uint32_t)nrows});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -975,14 +941,14 @@ static void ggml_vk_diag_mask_inf(
     };
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__))
-        s_algo = ctx->manager.algorithm<float, PushConstants>(__func__, ctx->pool.get(), {in, out}, spirv, {unsigned(ne00), unsigned(ne01), unsigned(ne02)}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(__func__))
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(__func__, ctx->device->pool.get(), {in, out}, spirv, {unsigned(ne00), unsigned(ne01), unsigned(ne02)}, {}, {pushConsts});
     else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({in, out});
         s_algo->setWorkgroup({unsigned(ne00), unsigned(ne01), unsigned(ne02)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1025,15 +991,15 @@ static void ggml_vk_mul_mat_f16(
     const unsigned ny = unsigned((ne11 + 4 - 1)/4);
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__)) {
+    if (!ctx->device->manager.hasAlgorithm(__func__)) {
         const uint32_t local_x = ggml_vk_current_device(ctx).subgroupSize * 2;
-        s_algo = ctx->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->pool.get(), {inA, inB, out}, spirv, {unsigned(ne01), ny, unsigned(ne12*ne13)}, {local_x}, {pushConsts});
+        s_algo = ctx->device->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->device->pool.get(), {inA, inB, out}, spirv, {unsigned(ne01), ny, unsigned(ne12*ne13)}, {local_x}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned(ne01), ny, unsigned(ne12*ne13)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1068,8 +1034,8 @@ static void ggml_vk_mul_mat_mat_f32(
 
     const uint32_t local_x = ggml_vk_current_device(ctx).subgroupSize;
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__)) {
-        s_algo = ctx->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->pool.get(),
+    if (!ctx->device->manager.hasAlgorithm(__func__)) {
+        s_algo = ctx->device->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->device->pool.get(),
         {inA, inB, out}, spirv,
         {unsigned(ne01),
          unsigned(ne11),
@@ -1078,14 +1044,14 @@ static void ggml_vk_mul_mat_mat_f32(
         {local_x},
         {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned(ne01),
                               unsigned(ne11),
                               unsigned(std::max(ne12, ne02)),
                               });
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1118,15 +1084,15 @@ static void ggml_vk_mul_mat_impl(
 
     auto name = std::string(__func__) + "_" + suffix;
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name)) {
+    if (!ctx->device->manager.hasAlgorithm(name)) {
         const uint32_t local_x = ggml_vk_current_device(ctx).subgroupSize * 2;
-        s_algo = ctx->manager.algorithm<uint32_t, PushConstants>(name, ctx->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 7)/8), unsigned(ne11), unsigned(ne12*ne13)}, {local_x}, {pushConsts});
+        s_algo = ctx->device->manager.algorithm<uint32_t, PushConstants>(name, ctx->device->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 7)/8), unsigned(ne11), unsigned(ne12*ne13)}, {local_x}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned((ne01 + 7)/8), unsigned(ne11), unsigned(ne12*ne13)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1177,15 +1143,15 @@ static void ggml_vk_mul_mat_q6_k(
     };
 
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(__func__)) {
+    if (!ctx->device->manager.hasAlgorithm(__func__)) {
         const uint32_t local_x = ggml_vk_current_device(ctx).subgroupSize * 2;
-        s_algo = ctx->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)}, {local_x}, {pushConsts});
+        s_algo = ctx->device->manager.algorithm<uint32_t, PushConstants>(__func__, ctx->device->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)}, {local_x}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(__func__);
+        s_algo = ctx->device->manager.getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1217,14 +1183,14 @@ static void ggml_vk_get_rows(
 
     auto name = std::string(__func__) + "_" + suffix;
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(name, ctx->pool.get(), {inA, inB, out}, spirv, {size}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(name)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(name, ctx->device->pool.get(), {inA, inB, out}, spirv, {size}, {}, {pushConsts});
     } else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({size});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1320,18 +1286,18 @@ static void ggml_vk_rope(
 
     auto name = std::string(__func__) + (src0t == GGML_TYPE_F16 ? "_f16" : "_f32");
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name)) {
-        s_algo = ctx->manager.algorithm<float, PushConstants>(
-            name, ctx->pool.get(), {inA, inB, out},
+    if (!ctx->device->manager.hasAlgorithm(name)) {
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(
+            name, ctx->device->pool.get(), {inA, inB, out},
             src0t == GGML_TYPE_F16 ? spirv_f16 : spirv_f32,
             {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts}
         );
     } else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({inA, inB, out});
         s_algo->setWorkgroup({unsigned(ne01), unsigned(ne02), unsigned(ne03)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1367,14 +1333,14 @@ static void ggml_vk_cpy(
                        + "_i_" + std::to_string(in_element_size)
                        + "_o_" + std::to_string(out_element_size);
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
-    if (!ctx->manager.hasAlgorithm(name))
-        s_algo = ctx->manager.algorithm<float, PushConstants>(name, ctx->pool.get(), {in, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts});
+    if (!ctx->device->manager.hasAlgorithm(name))
+        s_algo = ctx->device->manager.algorithm<float, PushConstants>(name, ctx->device->pool.get(), {in, out}, spirv, {unsigned(ne01), unsigned(ne02), unsigned(ne03)}, {}, {pushConsts});
     else {
-        s_algo = ctx->manager.getAlgorithm(name);
+        s_algo = ctx->device->manager.getAlgorithm(name);
         s_algo->setTensors({in, out});
         s_algo->setWorkgroup({unsigned(ne01), unsigned(ne02), unsigned(ne03)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
-        s_algo->updateDescriptors(ctx->pool.get());
+        s_algo->updateDescriptors(ctx->device->pool.get());
     }
     seq.record<kp::OpAlgoDispatch>(s_algo);
 }
@@ -1501,12 +1467,12 @@ static void ggml_vk_graph_compute(struct ggml_backend_kompute_context * ctx, str
 
     // FIXME: Figure out if we can somehow optimize the size of the pool... right now we're setting
     // it to the size of the graph, but I think it can be made smaller?
-    ggml_vk_allocate_descriptor_pool(ctx, gf->n_nodes);
+    ggml_vk_allocate_descriptor_pool(ctx->device, gf->n_nodes);
 
     std::vector<std::shared_ptr<kp::Sequence>> sequences(n_seq);
 
     for (auto& sequence : sequences) {
-        sequence = ctx->manager.sequence();
+        sequence = ctx->device->manager.sequence();
     }
     for (int seq_idx = 0; seq_idx < n_seq; ++seq_idx) {
         const int n_nodes_per_seq = (gf->n_nodes + n_seq - 1) / n_seq;
@@ -1585,9 +1551,9 @@ static void ggml_vk_graph_compute(struct ggml_backend_kompute_context * ctx, str
             uint32_t off_src0 = 0;
             uint32_t off_src1 = 0;
             uint32_t off_dst  = 0;
-            const std::shared_ptr<kp::Tensor>& id_src0 = src0 ? ggml_vk_get_tensor(ctx, src0, &off_src0) : nullTensor;
-            const std::shared_ptr<kp::Tensor>& id_src1 = src1 ? ggml_vk_get_tensor(ctx, src1, &off_src1) : nullTensor;
-            const std::shared_ptr<kp::Tensor>& id_dst  = dst  ? ggml_vk_get_tensor(ctx, dst,  &off_dst)  : nullTensor;
+            const std::shared_ptr<kp::Tensor>& id_src0 = src0 ? ggml_vk_get_tensor(ctx->device, src0, &off_src0) : nullTensor;
+            const std::shared_ptr<kp::Tensor>& id_src1 = src1 ? ggml_vk_get_tensor(ctx->device, src1, &off_src1) : nullTensor;
+            const std::shared_ptr<kp::Tensor>& id_dst  = dst  ? ggml_vk_get_tensor(ctx->device, dst,  &off_dst)  : nullTensor;
 
             switch (dst->op) {
                 case GGML_OP_ADD:
@@ -1844,7 +1810,7 @@ static void ggml_vk_graph_compute(struct ggml_backend_kompute_context * ctx, str
             sequence->evalAwait();
     }
 
-    ggml_vk_free_descriptor_pool(ctx);
+    ggml_vk_free_descriptor_pool(ctx->device);
 }
 
 template<>
@@ -1872,11 +1838,8 @@ static const char * ggml_backend_kompute_buffer_get_name(ggml_backend_buffer_t b
 
 static void ggml_backend_kompute_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_kompute_buffer_context *>(buffer->context);
-    auto * backend_ctx = kompute_backend_context(buffer);
-    if (backend_ctx && ggml_vk_has_device(backend_ctx)) {
-        ggml_vk_free_memory(backend_ctx, ctx->memory);
-    }
-    delete ctx;
+    ggml_vk_free_memory(ctx->device, ctx->memory);
+    delete ctx;;
 }
 
 static void * ggml_backend_kompute_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1885,37 +1848,40 @@ static void * ggml_backend_kompute_buffer_get_base(ggml_backend_buffer_t buffer)
 }
 
 static void ggml_backend_kompute_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-	auto * backend_ctx = kompute_backend_context(buffer);
+    auto * ctx = static_cast<ggml_backend_kompute_buffer_context *>(buffer->context);
+    kompute_device * device = ctx->device;
 
-    const auto res = ggml_vk_get_tensor(backend_ctx, tensor);
+    const auto res = ggml_vk_get_tensor(device, tensor);
     GGML_ASSERT(res);
 
     memcpy((char *)tensor->data + offset, data, size);
 
-    backend_ctx->manager.sequence()->eval<kp::OpTensorSyncDevice>({res});
+    device->manager.sequence()->eval<kp::OpTensorSyncDevice>({res});
 }
 
 static void ggml_backend_kompute_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-	auto * backend_ctx = kompute_backend_context(buffer);
+    auto * ctx = static_cast<ggml_backend_kompute_buffer_context *>(buffer->context);
+    kompute_device * device = ctx->device;
 
-    const auto res = ggml_vk_get_tensor(backend_ctx, tensor);
+    const auto res = ggml_vk_get_tensor(device, tensor);
     GGML_ASSERT(res);
 
-    backend_ctx->manager.sequence()->eval<kp::OpTensorSyncLocal>({res});
+    device->manager.sequence()->eval<kp::OpTensorSyncLocal>({res});
 
     memcpy(data, (const char *)tensor->data + offset, size);
 }
 
 static void ggml_backend_kompute_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * ctx = static_cast<ggml_backend_kompute_buffer_context *>(buffer->context);
-	auto * backend_ctx = kompute_backend_context(buffer);
+    kompute_device * device = ctx->device;
+
     memset(ctx->memory.data, value, ctx->memory.size);
 
     if (ctx->memory.stagingBuffer)
-        backend_ctx->manager.sequence()->eval<kp::OpBufferSyncDevice>(ctx->memory.primaryBuffer, ctx->memory.stagingBuffer, ctx->memory.size);
+        device->manager.sequence()->eval<kp::OpBufferSyncDevice>(ctx->memory.primaryBuffer, ctx->memory.stagingBuffer, ctx->memory.size);
 }
 
-static ggml_backend_buffer_i ggml_backend_kompute_buffer_i = {
+static ggml_backend_buffer_i ggml_backend_kompute_buffer_interface = {
     /* .get_name        = */ ggml_backend_kompute_buffer_get_name,
     /* .free_buffer     = */ ggml_backend_kompute_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_kompute_buffer_get_base,
@@ -1935,10 +1901,13 @@ static const char * ggml_backend_kompute_buffer_type_get_name(ggml_backend_buffe
 }
 
 static ggml_backend_buffer_t ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-	auto * backend_ctx = kompute_backend_context(buft);
-    auto * ctx = new ggml_backend_kompute_buffer_context;
-    ctx->memory = ggml_vk_allocate(backend_ctx, size);
-    return ggml_backend_buffer_init(buft, ggml_backend_kompute_buffer_i, ctx, size);
+	auto * buft_ctx = static_cast<ggml_backend_kompute_buffer_type_context *>(buft->context);
+    kompute_device * device = buft_ctx->device;
+
+    auto * buf_ctx = new ggml_backend_kompute_buffer_context;
+    buf_ctx->device = device;
+    buf_ctx->memory = ggml_vk_allocate(device, size);
+    return ggml_backend_buffer_init(buft, ggml_backend_kompute_buffer_interface, buf_ctx, size);
 }
 
 static size_t ggml_backend_kompute_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -1960,25 +1929,10 @@ static ggml_backend_buffer_type_i ggml_backend_kompute_buffer_type_interface = {
     /* .is_host          = */ NULL,
 };
 
-ggml_backend_buffer_type_t ggml_backend_kompute_buffer_type(int device) {
-    auto * backend = komputeManager.create_backend(device);
-    auto * buft = &(static_cast<ggml_backend_kompute_context *>(backend->context))->buft;
+ggml_backend_buffer_type_t ggml_backend_kompute_buffer_type(int index) {
+    kompute_device * device = komputeManager.get_device(index);
 
-    if (!buft->context) {
-        auto devices = ggml_vk_available_devices_internal(0);
-        for (std::size_t i = 0; i < devices.size(); i++) {
-            if (device == devices[i].index) {
-                buft->context = new ggml_backend_kompute_buffer_type_context(
-                        devices[i].index,
-                        devices[i].bufferAlignment,
-                        devices[i].maxAlloc);
-                buft->iface = ggml_backend_kompute_buffer_type_interface;
-                break;
-            }
-        }
-    }
-
-    return buft;
+    return device ? &device->buft : nullptr;
 }
 
 // backend
@@ -1989,12 +1943,16 @@ static const char * ggml_backend_kompute_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_kompute_free(ggml_backend_t backend) {
-    komputeManager.destroy_backend(backend);
+    if (!backend)
+        return;
+
+    delete static_cast<ggml_backend_kompute_context *>(backend->context);
+    delete backend;
 }
 
 static ggml_backend_buffer_type_t ggml_backend_kompute_get_default_buffer_type(ggml_backend_t backend) {
     auto * ctx = static_cast<ggml_backend_kompute_context *>(backend->context);
-    return ggml_backend_kompute_buffer_type(ctx->device);
+    return &ctx->device->buft;
 }
 
 static ggml_status ggml_backend_kompute_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2010,7 +1968,7 @@ static bool ggml_backend_kompute_supports_op(ggml_backend_t backend, const struc
 
 static bool ggml_backend_kompute_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
     auto *ctx = static_cast<ggml_backend_kompute_context *>(backend->context);
-    return &ctx->buft == buft;
+    return &ctx->device->buft == buft;
 }
 
 static bool ggml_backend_kompute_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
@@ -2021,7 +1979,7 @@ static bool ggml_backend_kompute_offload_op(ggml_backend_t backend, const ggml_t
            (op->ne[2] >= min_batch_size && op->op == GGML_OP_MUL_MAT_ID);
 }
 
-static struct ggml_backend_i kompute_backend_i = {
+static struct ggml_backend_i ggml_backend_kompute_interface = {
     /* .get_name                = */ ggml_backend_kompute_name,
     /* .free                    = */ ggml_backend_kompute_free,
     /* .get_default_buffer_type = */ ggml_backend_kompute_get_default_buffer_type,
@@ -2051,20 +2009,25 @@ static ggml_guid_t ggml_backend_kompute_guid() {
 
 
 
-kompute_manager::kompute_manager() : m_backends(GGML_KOMPUTE_MAX_DEVICES, nullptr)
+kompute_manager::kompute_manager() : m_devices(GGML_KOMPUTE_MAX_DEVICES, nullptr)
 {
     m_kp_manager = nullptr;
 }
 
 kompute_manager::~kompute_manager()
 {
+    for (std::size_t i = 0; i < m_devices.size(); i++) {
+        if (m_devices[i]) {
+            delete static_cast<ggml_backend_kompute_buffer_type_context *>(m_devices[i]->buft.context);
+            // FIXME: delete will cause a kompute crash
+            // delete m_devices[i];
+            m_devices[i] = nullptr;
+        }
+    }
+
     if (m_kp_manager) {
         delete m_kp_manager;
         m_kp_manager = nullptr;
-    }
-
-    for (std::size_t i = 0; i < m_backends.size(); i++) {
-        destroy_backend(m_backends[i]);
     }
 }
 
@@ -2076,67 +2039,70 @@ kp::Manager * kompute_manager::get_kp_manager(void)
     return m_kp_manager;
 }
 
-ggml_backend_t kompute_manager::create_backend(int device)
+kompute_device * kompute_manager::get_device(int index)
 {
-    if (device < 0 || device >= GGML_KOMPUTE_MAX_DEVICES)
+    if (index < 0 || static_cast<std::size_t>(index) >= m_devices.size())
         return nullptr;
+    
+    if (!m_devices[index]) {
+        kompute_device * device = new kompute_device();
 
-    // already exist
-    ggml_backend_t backend = get_backend(device);
-    if (backend)
-        return backend;
-
-    // create new one
-    auto *context = new ggml_backend_kompute_context(device);
-    context->manager.initializeDevice(device, {},
-        {
+        device->index = index;
+        device->name = ggml_kompute_format_name(index);
+        device->manager.initializeDevice(index, {}, {
             "VK_KHR_shader_float16_int8",
             "VK_KHR_8bit_storage",
             "VK_KHR_16bit_storage",
             "VK_KHR_shader_non_semantic_info"
         });
 
-    backend = new ggml_backend {
+        auto devices = ggml_vk_available_devices_internal(0);
+        for (std::size_t i = 0; i < devices.size(); i++) {
+            if (index == devices[i].index) {
+                auto * buft_ctx = new ggml_backend_kompute_buffer_type_context();
+                buft_ctx->name = ggml_kompute_format_name(index);
+                buft_ctx->device = device;
+                buft_ctx->buffer_alignment = devices[i].bufferAlignment;
+                buft_ctx->max_alloc = devices[i].maxAlloc;
+            
+                device->buft.context = buft_ctx;
+                device->buft.iface = ggml_backend_kompute_buffer_type_interface;
+
+                break;
+            }
+        }
+
+        m_devices[index] = device;
+
+        std::cerr << "Kompute: create device " << index << std::endl;
+    }
+
+    return m_devices[index];
+}
+
+
+
+ggml_backend_t ggml_backend_kompute_init(int index) {
+    if (index < 0 || index >= GGML_KOMPUTE_MAX_DEVICES)
+        return nullptr;
+
+    kompute_device * device = komputeManager.get_device(index);
+    if (!device)
+        return nullptr;
+
+    ggml_backend_kompute_context * context = new ggml_backend_kompute_context();
+    context->name = ggml_kompute_format_name(index);
+    context->device = device;
+
+    ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_kompute_guid(),
-        /* .interface = */ kompute_backend_i,
+        /* .interface = */ ggml_backend_kompute_interface,
         /* .context   = */ context,
     };
 
-    m_backends[device] = backend;
-
-    std::cerr << "Kompute: Init device " << device << std::endl;
+    std::cerr << "Kompute: Init backend " << index << std::endl;
 
     return backend;
-}
-
-void kompute_manager::destroy_backend(ggml_backend_t backend)
-{
-    if (!backend)
-        return;
-
-    for (std::size_t i = 0; i < m_backends.size(); i++) {
-        if (backend == m_backends[i]) {
-            auto *context = static_cast<ggml_backend_kompute_context *>(backend->context);
-            delete context;
-            delete backend;
-            m_backends[i] = nullptr;
-            break;
-        }
-    }
-}
-
-ggml_backend_t kompute_manager::get_backend(int device)
-{
-    if (device >= 0 && static_cast<std::size_t>(device) < m_backends.size())
-        return m_backends[device];
-
-    return nullptr;
-}
-
-
-
-ggml_backend_t ggml_backend_kompute_init(int device) {
-    return komputeManager.create_backend(device);
 }
 
 bool ggml_backend_is_kompute(ggml_backend_t backend) {
